@@ -68,7 +68,7 @@ const Chunk = struct {
     const ChunkError = error{
         TruncatedChunk,
         InvalidChunkLength,
-        InvalidCksum,
+        InvalidCrc,
     } || ChunkType.ChunkTypeError;
 
     length: u32,
@@ -98,12 +98,11 @@ const Chunk = struct {
             return ChunkError.TruncatedChunk;
 
         chunk.chunk_type = try ChunkType.init(data[4..][0..4].*);
-        chunk.data = data[4 * 2 ..][0..chunk.length].ptr; // redundant, but okay
+        chunk.data = data.ptr + 4 * 2; // redundant, but okay
 
         const crc32: u32 = std.mem.readInt(u32, data[4 * 2 + chunk.length ..][0..4], .big);
-        std.debug.print("{x}:{x}\n", .{ crc32, chunk.crc() });
         if (crc32 != chunk.crc())
-            return ChunkError.InvalidCksum;
+            return ChunkError.InvalidCrc;
 
         return chunk;
     }
@@ -123,15 +122,17 @@ const Chunk = struct {
         try reader.readNoEof(data);
 
         const crc32: u32 = try reader.readInt(u32, .big);
-        std.debug.print("{x}:{x}\n", .{ crc32, chunk.crc() });
         if (crc32 != chunk.crc())
-            return ChunkError.InvalidCksum;
+            return ChunkError.InvalidCrc;
 
         return chunk;
     }
 
     pub fn crc(chunk: Chunk) u32 { // TODO: fix hash to include chunk type. But how?
-        return std.hash.crc.Crc32Cksum.hash(chunk.data[0..chunk.length]);
+        var crc32 = std.hash.crc.Crc32.init();
+        crc32.update(chunk.chunk_type.bytes[0..]);
+        crc32.update(chunk.data[0..chunk.length]);
+        return crc32.final();
     }
 };
 
@@ -232,7 +233,12 @@ fn testing_chunk() !Chunk {
     const chunk_one: Chunk = try Chunk.read(buffer);
     defer alloc.free(chunk_two.data[0..chunk_two.length]);
 
-    try testing.expectEqualDeep(chunk_one, chunk_two);
+    try testing.expectEqual(chunk_one.crc(), chunk_two.crc());
+    try testing.expectEqualSlices(
+        u8,
+        chunk_one.data[0..chunk_one.length],
+        chunk_two.data[0..chunk_two.length],
+    );
     return chunk_one;
 }
 
