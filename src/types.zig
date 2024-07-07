@@ -1,7 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
+const Crc32 = std.hash.crc.Crc32;
 
-const ChunkType = struct {
+pub const ChunkType = struct {
     const ChunkTypeError = error{InvalidChunkType};
 
     bytes: [4]u8,
@@ -55,7 +56,7 @@ const ChunkType = struct {
         _ = fmt;
         _ = options;
 
-        try writer.print("'{s}' ([4]u8{s}, {s}, {s})", .{
+        try writer.print("\"{s}\" ({s}, {s}, {s})", .{
             self.bytes,
             if (self.is_critical()) "critical" else "ancillary",
             if (self.is_public()) "public" else "private",
@@ -64,7 +65,7 @@ const ChunkType = struct {
     }
 };
 
-const Chunk = struct {
+pub const Chunk = struct {
     const ChunkError = error{
         TruncatedChunk,
         InvalidChunkLength,
@@ -75,17 +76,19 @@ const Chunk = struct {
     chunk_type: ChunkType,
     data: [*]const u8,
 
-    pub fn init(chunk_type: ChunkType, data: []u8) ChunkError!Chunk {
+    /// initialise chunk without copying any data.
+    pub fn init(chunk_type: ChunkType, data: []const u8) ChunkError!Chunk {
         if (data.len > 2 << 30)
             return ChunkError.TruncatedChunk;
 
         return .{
-            .length = data.len,
+            .length = @truncate(data.len),
             .chunk_type = chunk_type,
             .data = data.ptr,
         };
     }
 
+    /// read chunk from buffer without copying the chunk data.
     pub fn read(data: []u8) ChunkError!Chunk {
         var chunk: Chunk = undefined;
 
@@ -107,6 +110,8 @@ const Chunk = struct {
         return chunk;
     }
 
+    /// read chunk from stream, reading the chunk data to a buffer using `allocator`.
+    /// the `data` field of the returned chunk should be deallocated after use.
     pub fn readStream(reader: anytype, allocator: std.mem.Allocator) !Chunk {
         var chunk: Chunk = undefined;
 
@@ -128,8 +133,9 @@ const Chunk = struct {
         return chunk;
     }
 
-    pub fn crc(chunk: Chunk) u32 { // TODO: fix hash to include chunk type. But how?
-        var crc32 = std.hash.crc.Crc32.init();
+    /// calculate 32-bit CRC on chunk type and data fields.
+    pub fn crc(chunk: Chunk) u32 {
+        var crc32: Crc32 = Crc32.init();
         crc32.update(chunk.chunk_type.bytes[0..]);
         crc32.update(chunk.data[0..chunk.length]);
         return crc32.final();
@@ -211,37 +217,76 @@ test "chunk_type_type_string" {
     try testing.expectEqualSlices(u8, &chunk_type.bytes, "RuSt");
 }
 
-fn testing_chunk() !Chunk {
-    const alloc = std.testing.allocator;
+fn chunk_buffer(
+    chunk_type: []const u8,
+    data: []const u8,
+    data_length: u32,
+    crc32: u32,
+    alloc: std.mem.Allocator,
+) ![]u8 {
+    const buffer: []u8 = try alloc.alloc(u8, 4 * 3 + data_length);
+    std.mem.writeInt(u32, buffer[4 * 0 ..][0..4], data_length, .big);
+    std.mem.copyForwards(u8, buffer[4 * 1 ..], chunk_type);
+    std.mem.copyForwards(u8, buffer[4 * 2 ..], data);
+    std.mem.writeInt(u32, buffer[4 * 2 + data_length ..][0..4], crc32, .big);
+    return buffer;
+}
 
+test "new_chunk" {
+    const chunk_type: ChunkType = try ChunkType.init("RuSt".*);
+    const data: []const u8 = "This is where your secret message will be!";
+    const chunk: Chunk = try Chunk.init(chunk_type, data);
+    try testing.expectEqual(42, chunk.length);
+    try testing.expectEqual(2882656334, chunk.crc());
+}
+
+test "chunk_crc" {
+    const alloc = std.testing.allocator;
     const chunk_type: []const u8 = "RuSt";
     const message: []const u8 = "This is where your secret message will be!";
     const data_length: u32 = @truncate(message.len);
     const crc32: u32 = 2882656334;
 
-    const buffer: []u8 = try alloc.alloc(u8, 4 * 3 + data_length);
-    std.mem.writeInt(u32, buffer[4 * 0 ..][0..4], data_length, .big);
-    std.mem.copyForwards(u8, buffer[4 * 1 ..], chunk_type);
-    std.mem.copyForwards(u8, buffer[4 * 2 ..], message);
-    std.mem.writeInt(u32, buffer[4 * 2 + data_length ..][0..4], crc32, .big);
+    const buffer: []u8 = try chunk_buffer(
+        chunk_type,
+        message,
+        data_length,
+        crc32,
+        alloc,
+    );
     defer alloc.free(buffer);
 
     var fbs = std.io.fixedBufferStream(buffer);
     const reader = fbs.reader();
 
-    const chunk_two: Chunk = try Chunk.readStream(reader, alloc);
-    const chunk_one: Chunk = try Chunk.read(buffer);
-    defer alloc.free(chunk_two.data[0..chunk_two.length]);
+    var chunks: [2]Chunk = undefined;
+    chunks[0] = try Chunk.read(buffer);
+    chunks[1] = try Chunk.readStream(reader, alloc);
+    defer alloc.free(chunks[1].data[0..chunks[1].length]);
 
-    try testing.expectEqual(chunk_one.crc(), chunk_two.crc());
-    try testing.expectEqualSlices(
-        u8,
-        chunk_one.data[0..chunk_one.length],
-        chunk_two.data[0..chunk_two.length],
-    );
-    return chunk_one;
+    for (chunks) |chunk| {
+        try testing.expectEqual(42, chunk.length);
+        try testing.expectEqualSlices(u8, "RuSt", chunk.chunk_type.bytes[0..]);
+        try testing.expectEqual(2882656334, chunk.crc());
+        try testing.expectEqualSlices(u8, "This is where your secret message will be!", chunk.data[0..chunk.length]);
+    }
 }
 
-test "chunk" {
-    _ = try testing_chunk();
+test "invalid_chunk" {
+    const alloc = std.testing.allocator;
+    const chunk_type: []const u8 = "RuSt";
+    const message: []const u8 = "This is where your secret message will be!";
+    const data_length: u32 = @truncate(message.len);
+    const crc32: u32 = 2882656333; // this changed
+
+    const buffer: []u8 = try chunk_buffer(
+        chunk_type,
+        message,
+        data_length,
+        crc32,
+        alloc,
+    );
+    defer alloc.free(buffer);
+
+    try testing.expectError(Chunk.ChunkError.InvalidCrc, Chunk.read(buffer));
 }
