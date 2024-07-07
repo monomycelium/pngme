@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Crc32 = std.hash.crc.Crc32;
+const Allocator = std.mem.Allocator;
 
 pub const ChunkType = struct {
     const ChunkTypeError = error{InvalidChunkType};
@@ -71,6 +72,7 @@ pub const Chunk = struct {
         InvalidChunkLength,
         InvalidCrc,
     } || ChunkType.ChunkTypeError;
+    const ChunkStreamError = ChunkError || Allocator.Error || std.io.AnyReader.Error || error{NoData};
 
     length: u32,
     chunk_type: ChunkType,
@@ -110,12 +112,13 @@ pub const Chunk = struct {
         return chunk;
     }
 
-    /// read chunk from stream, reading the chunk data to a buffer using `allocator`.
-    /// the `data` field of the returned chunk should be deallocated after use.
-    pub fn readStream(reader: anytype, allocator: std.mem.Allocator) !Chunk {
+    fn readStreamInner(reader: anytype, allocator: Allocator) ChunkStreamError!Chunk {
         var chunk: Chunk = undefined;
 
-        chunk.length = try reader.readInt(u32, .big);
+        chunk.length = reader.readInt(u32, .big) catch |err| return switch (@as(anyerror, @errorCast(err))) {
+            error.EndOfStream => ChunkStreamError.NoData, // what if it's not?
+            else => err,
+        };
 
         if (chunk.length > 2 << 30)
             return ChunkError.TruncatedChunk;
@@ -133,12 +136,101 @@ pub const Chunk = struct {
         return chunk;
     }
 
+    /// read chunk from stream, reading the chunk data to a buffer using `allocator`.
+    /// the `data` field of the returned chunk should be deallocated after use.
+    pub fn readStream(reader: anytype, allocator: Allocator) ChunkStreamError!Chunk {
+        return readStreamInner(reader, allocator) catch |err| switch (err) {
+            error.EndOfStream => ChunkStreamError.TruncatedChunk,
+            else => err,
+        };
+    }
+
     /// calculate 32-bit CRC on chunk type and data fields.
     pub fn crc(chunk: Chunk) u32 {
         var crc32: Crc32 = Crc32.init();
         crc32.update(chunk.chunk_type.bytes[0..]);
         crc32.update(chunk.data[0..chunk.length]);
         return crc32.final();
+    }
+
+    pub fn format(
+        self: Chunk,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.print("Chunk ({s}, {x})", .{
+            self.chunk_type.bytes[0..],
+            self.crc(),
+        });
+
+        // try writer.writeAll(" 0x");
+        // try std.fmt.fmtSliceHexLower(self.data[0..self.length]).format(fmt, options, writer);
+        try writer.writeAll(" \"");
+        try std.fmt.fmtSliceEscapeLower(self.data[0..self.length]).format(fmt, options, writer);
+        try writer.writeByte('"');
+    }
+};
+
+pub fn ChunkIterator(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        reader: T,
+        allocator: Allocator,
+
+        pub fn next(self: Self) !?Chunk {
+            return Chunk.readStream(self.reader, self.allocator) catch |err| switch (err) {
+                Chunk.ChunkStreamError.NoData => null,
+                else => err,
+            };
+        }
+    };
+}
+
+pub const Png = struct {
+    pub const STANDARD_HEADER: []const u8 = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a";
+    const Chunks = std.ArrayList(Chunk);
+    const PngError = error{ InvalidHeader, InvalidStartChunk, InvalidEndChunk, MissingChunks };
+    const Self = @This();
+
+    chunks: Chunks,
+
+    pub fn init(allocator: Allocator) !Png {
+        return .{ .chunks, try Chunks.initCapacity(allocator, 2) };
+    }
+
+    pub fn deinit(self: Self) void {
+        self.chunks.deinit();
+    }
+
+    pub fn read(allocator: Allocator, reader: anytype) !Png {
+        var self: Png = try Png.init(allocator);
+        errdefer self.deinit();
+
+        var header: [STANDARD_HEADER.len]u8 = undefined;
+        try reader.readNoEof(header[0..]);
+        if (!std.mem.eql(u8, STANDARD_HEADER, header[0..]))
+            return PngError.InvalidHeader;
+
+        const Iter = ChunkIterator(@TypeOf(reader));
+        var iter: Iter = .{
+            .reader = reader,
+            .allocator = allocator,
+        };
+
+        if (try iter.next()) |chunk| {
+            if (!std.mem.eql(u8, chunk.chunk_type.bytes, "IHDR")) return PngError.InvalidStartChunk;
+            try self.chunks.append(chunk);
+        } else return PngError.MissingChunks;
+
+        while (try iter.next()) |chunk| try self.chunks.append(chunk);
+
+        const len: usize = self.chunks.items.len;
+        if (len < 2) return PngError.MissingChunks;
+        if (!std.mem.eql(u8, self.chunks.items[len - 1].chunk_type.bytes, "IEND")) return PngError.InvalidEndChunk;
+
+        return self;
     }
 };
 
@@ -222,7 +314,7 @@ fn chunk_buffer(
     data: []const u8,
     data_length: u32,
     crc32: u32,
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
 ) ![]u8 {
     const buffer: []u8 = try alloc.alloc(u8, 4 * 3 + data_length);
     std.mem.writeInt(u32, buffer[4 * 0 ..][0..4], data_length, .big);
@@ -269,6 +361,8 @@ test "chunk_crc" {
         try testing.expectEqualSlices(u8, "RuSt", chunk.chunk_type.bytes[0..]);
         try testing.expectEqual(2882656334, chunk.crc());
         try testing.expectEqualSlices(u8, "This is where your secret message will be!", chunk.data[0..chunk.length]);
+
+        std.debug.print("{}\n", .{chunk});
     }
 }
 
