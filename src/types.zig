@@ -72,7 +72,9 @@ pub const Chunk = struct {
         InvalidChunkLength,
         InvalidCrc,
     } || ChunkType.ChunkTypeError;
-    const ChunkStreamError = ChunkError || Allocator.Error || std.io.AnyReader.Error || error{NoData};
+    const ChunkReadStreamError = ChunkError || Allocator.Error || std.io.AnyReader.Error || error{NoData};
+    const ChunkWriteStreamError = std.io.AnyWriter.Error;
+    const ChunkWriteError = error{Overflow};
 
     length: u32,
     chunk_type: ChunkType,
@@ -112,11 +114,11 @@ pub const Chunk = struct {
         return chunk;
     }
 
-    fn readStreamInner(reader: anytype, allocator: Allocator) ChunkStreamError!Chunk {
+    fn readStreamInner(reader: anytype, allocator: Allocator) ChunkReadStreamError!Chunk {
         var chunk: Chunk = undefined;
 
         chunk.length = reader.readInt(u32, .big) catch |err| return switch (@as(anyerror, @errorCast(err))) {
-            error.EndOfStream => ChunkStreamError.NoData, // what if it's not?
+            error.EndOfStream => ChunkReadStreamError.NoData, // what if it's not?
             else => err,
         };
 
@@ -138,11 +140,32 @@ pub const Chunk = struct {
 
     /// read chunk from stream, reading the chunk data to a buffer using `allocator`.
     /// the `data` field of the returned chunk should be deallocated after use.
-    pub fn readStream(reader: anytype, allocator: Allocator) ChunkStreamError!Chunk {
+    pub fn readStream(reader: anytype, allocator: Allocator) ChunkReadStreamError!Chunk {
         return readStreamInner(reader, allocator) catch |err| switch (err) {
-            error.EndOfStream => ChunkStreamError.TruncatedChunk,
+            error.EndOfStream => ChunkReadStreamError.TruncatedChunk,
             else => err,
         };
+    }
+
+    /// write chunk to buffer.
+    pub fn write(self: Chunk, buffer: []u8) ChunkWriteError![]u8 {
+        if (buffer.len < self.length + 4 * 3)
+            return ChunkWriteError.Overflow;
+
+        std.mem.writeInt(u32, buffer[4 * 0 ..][0..4], self.length, .big);
+        std.mem.copyForwards(u8, buffer[4 * 1 ..], self.chunk_type.bytes[0..]);
+        std.mem.copyForwards(u8, buffer[4 * 2 ..], self.data[0..self.length]);
+        std.mem.writeInt(u32, buffer[4 * 2 + self.length ..][0..4], self.crc(), .big);
+
+        return buffer[0..self.length + 4 * 3];
+    }
+
+    /// write chunk to stream.
+    pub fn writeStream(self: Chunk, writer: anytype) ChunkWriteStreamError!void {
+        try writer.writeInt(u32, self.length, .big);
+        try writer.writeAll(self.chunk_type.bytes[0..]);
+        try writer.writeAll(self.data[0..self.length]);
+        try writer.writeInt(u32, self.crc(), .big);
     }
 
     /// calculate 32-bit CRC on chunk type and data fields.
@@ -181,7 +204,7 @@ pub fn ChunkIterator(comptime T: type) type {
 
         pub fn next(self: Self) !?Chunk {
             return Chunk.readStream(self.reader, self.allocator) catch |err| switch (err) {
-                Chunk.ChunkStreamError.NoData => null,
+                Chunk.ChunkReadStreamError.NoData => null,
                 else => err,
             };
         }
@@ -231,6 +254,18 @@ pub const Png = struct {
         if (!std.mem.eql(u8, self.chunks.items[len - 1].chunk_type.bytes, "IEND")) return PngError.InvalidEndChunk;
 
         return self;
+    }
+
+    pub fn format(
+        self: Png,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+
+        for (self.chunks.items) |chunk|
+            try chunk.format("{}", options, writer);
     }
 };
 
@@ -361,6 +396,11 @@ test "chunk_crc" {
         try testing.expectEqualSlices(u8, "RuSt", chunk.chunk_type.bytes[0..]);
         try testing.expectEqual(2882656334, chunk.crc());
         try testing.expectEqualSlices(u8, "This is where your secret message will be!", chunk.data[0..chunk.length]);
+
+        const buf: []u8 = try alloc.alloc(u8, buffer.len);
+        defer alloc.free(buf);
+        const new: []u8 = try chunk.write(buf);
+        try testing.expectEqualSlices(u8, buffer, new);
 
         std.debug.print("{}\n", .{chunk});
     }
