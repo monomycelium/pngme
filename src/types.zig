@@ -6,6 +6,19 @@ const Allocator = std.mem.Allocator;
 pub const ChunkType = struct {
     const ChunkTypeError = error{InvalidChunkType};
 
+    pub const ChunkTypeContext = struct {
+        const Self = @This();
+
+        pub fn hash(self: Self, chunk_type: ChunkType) u64 {
+            _ = self;
+            return std.mem.readInt(u32, chunk_type.bytes[0..], .big);
+        }
+
+        pub fn eql(self: Self, a: ChunkType, b: ChunkType) bool {
+            return self.hash(a) == self.hash(b);
+        }
+    };
+
     bytes: [4]u8,
 
     pub fn init(bytes: [4]u8) ChunkTypeError!ChunkType {
@@ -157,7 +170,7 @@ pub const Chunk = struct {
         std.mem.copyForwards(u8, buffer[4 * 2 ..], self.data[0..self.length]);
         std.mem.writeInt(u32, buffer[4 * 2 + self.length ..][0..4], self.crc(), .big);
 
-        return buffer[0..self.length + 4 * 3];
+        return buffer[0 .. self.length + 4 * 3];
     }
 
     /// write chunk to stream.
@@ -211,23 +224,57 @@ pub fn ChunkIterator(comptime T: type) type {
     };
 }
 
-pub const Png = struct {
+pub const Png = struct { // TODO: add write functions!
     pub const STANDARD_HEADER: []const u8 = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a";
+    const Self = @This();
     const Chunks = std.ArrayList(Chunk);
     const PngError = error{ InvalidHeader, InvalidStartChunk, InvalidEndChunk, MissingChunks };
-    const Self = @This();
+    const PngModError = error{EmptyList} || Allocator.Error;
+    const ChunkList = std.ArrayList(*Chunk);
+    const Map = std.hash_map.HashMap([4]u8, ChunkList, ChunkType.ChunkTypeContext{}, 80);
 
     chunks: Chunks,
 
-    pub fn init(allocator: Allocator) !Png {
-        return .{ .chunks, try Chunks.initCapacity(allocator, 2) };
+    pub fn init(allocator: Allocator) Allocator.Error!Self {
+        return .{ .chunks = try Chunks.initCapacity(allocator, 2) };
+    }
+
+    /// Initialise from existing slice of `chunks` allocated using `allocator`.
+    pub fn initFromChunks(allocator: Allocator, chunks: []Chunk) Self {
+        return .{ .chunks = .{
+            .items = chunks,
+            .capacity = chunks.len,
+            .allocator = allocator,
+        } };
+    }
+
+    /// Append a chunk.
+    pub fn appendChunk(self: *Self, chunk: Chunk) PngModError!void {
+        try self.chunks.append(chunk);
+    }
+
+    /// Generate a hash map, where chunk type is the key and pointer to chunk is the value.
+    pub fn chunksByType(self: Self) !Map {
+        var map = Map.init(self.chunks.allocator);
+        errdefer map.deinit();
+
+        for (self.chunks.items) |*chunk| {
+            const result = try map.getOrPut(chunk.chunk_type.bytes);
+
+            if (!result.found_existing)
+                result.value_ptr.* = try ChunkList.initCapacity(self.chunks.allocator, 1);
+
+            try result.value_ptr.append(chunk);
+        }
+
+        return map;
     }
 
     pub fn deinit(self: Self) void {
         self.chunks.deinit();
     }
 
-    pub fn read(allocator: Allocator, reader: anytype) !Png {
+    pub fn readStream(allocator: Allocator, reader: anytype) !Png {
         var self: Png = try Png.init(allocator);
         errdefer self.deinit();
 
