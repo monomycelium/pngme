@@ -9,12 +9,13 @@ pub const ChunkType = struct {
     pub const ChunkTypeContext = struct {
         const Self = @This();
 
-        pub fn hash(self: Self, chunk_type: ChunkType) u64 {
+        pub fn hash(self: Self, chunk_type: [4]u8) u32 {
             _ = self;
-            return std.mem.readInt(u32, chunk_type.bytes[0..], .big);
+            return std.mem.readInt(u32, chunk_type[0..], .big);
         }
 
-        pub fn eql(self: Self, a: ChunkType, b: ChunkType) bool {
+        pub fn eql(self: Self, a: [4]u8, b: [4]u8, b_index: usize) bool {
+            _ = b_index;
             return self.hash(a) == self.hash(b);
         }
     };
@@ -88,6 +89,7 @@ pub const Chunk = struct {
     const ChunkReadStreamError = ChunkError || Allocator.Error || std.io.AnyReader.Error || error{NoData};
     const ChunkWriteStreamError = std.io.AnyWriter.Error;
     const ChunkWriteError = error{Overflow};
+    const Self = @This();
 
     length: u32,
     chunk_type: ChunkType,
@@ -103,6 +105,11 @@ pub const Chunk = struct {
             .chunk_type = chunk_type,
             .data = data.ptr,
         };
+    }
+
+    /// deallocates chunk (where the data field must be allocated by `allocator`).
+    pub fn deinit(self: Self, allocator: Allocator) void {
+        allocator.free(self.data[0..self.length]);
     }
 
     /// read chunk from buffer without copying the chunk data.
@@ -231,7 +238,7 @@ pub const Png = struct { // TODO: add write functions!
     const PngError = error{ InvalidHeader, InvalidStartChunk, InvalidEndChunk, MissingChunks };
     const PngModError = error{EmptyList} || Allocator.Error;
     const ChunkList = std.ArrayList(*Chunk);
-    const Map = std.hash_map.HashMap([4]u8, ChunkList, ChunkType.ChunkTypeContext{}, 80);
+    const Map = std.array_hash_map.ArrayHashMap([4]u8, ChunkList, ChunkType.ChunkTypeContext, true);
 
     chunks: Chunks,
 
@@ -270,16 +277,34 @@ pub const Png = struct { // TODO: add write functions!
         return map;
     }
 
+    pub fn deinitMap(map: *Map) void {
+        var iter = map.iterator();
+        while (iter.next()) |entry|
+            entry.value_ptr.deinit();
+        map.deinit();
+    }
+
     pub fn deinit(self: Self) void {
         self.chunks.deinit();
     }
 
+    // TODO: find better name
+    /// deallocate every chunk and the arraylist (using the allocator from the list).
+    pub fn deinitAllocatedChunks(self: Self) void {
+        for (self.chunks.items) |chunk|
+            chunk.deinit(self.chunks.allocator);
+
+        self.deinit();
+    }
+
+    /// read PNG data from stream.
     pub fn readStream(allocator: Allocator, reader: anytype) !Png {
         var self: Png = try Png.init(allocator);
         errdefer self.deinit();
 
         var header: [STANDARD_HEADER.len]u8 = undefined;
-        try reader.readNoEof(header[0..]);
+        const n = try reader.readAll(header[0..]);
+        try testing.expectEqual(STANDARD_HEADER.len, n);
         if (!std.mem.eql(u8, STANDARD_HEADER, header[0..]))
             return PngError.InvalidHeader;
 
@@ -290,7 +315,7 @@ pub const Png = struct { // TODO: add write functions!
         };
 
         if (try iter.next()) |chunk| {
-            if (!std.mem.eql(u8, chunk.chunk_type.bytes, "IHDR")) return PngError.InvalidStartChunk;
+            if (!std.mem.eql(u8, chunk.chunk_type.bytes[0..], "IHDR")) return PngError.InvalidStartChunk;
             try self.chunks.append(chunk);
         } else return PngError.MissingChunks;
 
@@ -298,9 +323,29 @@ pub const Png = struct { // TODO: add write functions!
 
         const len: usize = self.chunks.items.len;
         if (len < 2) return PngError.MissingChunks;
-        if (!std.mem.eql(u8, self.chunks.items[len - 1].chunk_type.bytes, "IEND")) return PngError.InvalidEndChunk;
+        if (!std.mem.eql(u8, self.chunks.items[len - 1].chunk_type.bytes[0..], "IEND")) return PngError.InvalidEndChunk;
 
         return self;
+    }
+
+    /// write PNG data to stream.
+    pub fn writeStream(self: Self, writer: anytype) !void {
+        try writer.writeAll(Self.STANDARD_HEADER);
+        for (self.chunks.items) |chunk|
+            try chunk.writeStream(writer);
+    }
+
+    /// write PNG data to buffer.
+    pub fn write(self: Self, buffer: []u8) ![]u8 {
+        std.mem.copyForwards(u8, buffer, Self.STANDARD_HEADER);
+        var i: usize = Self.STANDARD_HEADER.len;
+
+        for (self.chunks.items) |chunk| {
+            const out = try chunk.write(buffer[i..]);
+            i += out.len;
+        }
+
+        return buffer[0..i];
     }
 
     pub fn format(
@@ -470,4 +515,83 @@ test "invalid_chunk" {
     defer alloc.free(buffer);
 
     try testing.expectError(Chunk.ChunkError.InvalidCrc, Chunk.read(buffer));
+}
+
+fn chunk_from_strings(chunk_type: [4]u8, data: []const u8) Chunk {
+    return .{
+        .chunk_type = .{ .bytes = chunk_type },
+        .data = data.ptr,
+        .length = @truncate(data.len),
+    };
+}
+
+const chunk_array = [_]Chunk{
+    chunk_from_strings("IHDR".*, "I am the first chunk"),
+    chunk_from_strings("FrSt".*, "I am the first chunk"),
+    chunk_from_strings("miDl".*, "I am another chunk"),
+    chunk_from_strings("LASt".*, "I am the second-last chunk"),
+    chunk_from_strings("LASt".*, "I am the last chunk"),
+    chunk_from_strings("IEND".*, "I am the first chunk"),
+};
+
+fn testing_chunks() ![]Chunk {
+    const List = std.ArrayList(Chunk);
+    var list = try List.initCapacity(testing.allocator, chunk_array.len);
+    list.appendSliceAssumeCapacity(chunk_array[0..]);
+    return try list.toOwnedSlice();
+}
+
+test "from chunks" {
+    const chunks = try testing_chunks();
+    defer testing.allocator.free(chunks);
+
+    const png = Png.initFromChunks(testing.allocator, chunks);
+    try testing.expectEqual(png.chunks.items.len, chunk_array.len);
+
+    var size: usize = Png.STANDARD_HEADER.len;
+    for (png.chunks.items) |chunk| size += chunk.length + 4 * 3;
+
+    var buffers: [2][]u8 = undefined;
+    for (&buffers) |*b| b.* = try testing.allocator.alloc(u8, size);
+    defer for (&buffers) |b| testing.allocator.free(b);
+    var fbs = std.io.fixedBufferStream(buffers[1]);
+    const writer = fbs.writer();
+
+    const out = try png.write(buffers[0]);
+    try png.writeStream(writer);
+
+    try testing.expectEqualSlices(u8, out, buffers[1]);
+
+    var map = try png.chunksByType();
+    defer Png.deinitMap(&map);
+
+    const list = map.get("LASt".*).?;
+    for (list.items, 0..) |c, i|
+        try testing.expectEqual(c.crc(), chunks[3 + i].crc());
+
+    fbs.seekTo(0) catch unreachable;
+    const reader = fbs.reader();
+    const new_png = try Png.readStream(testing.allocator, reader);
+    defer new_png.deinitAllocatedChunks();
+
+    for (new_png.chunks.items, 0..) |chunk, i|
+        try testing.expectEqual(chunk.crc(), png.chunks.items[i].crc());
+}
+
+test "invalid_header" {
+    var size: usize = Png.STANDARD_HEADER.len;
+    for (chunk_array) |chunk| size += chunk.length + 4 * 3;
+
+    const buffer: []u8 = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(buffer);
+    var fbs = std.io.fixedBufferStream(buffer);
+
+    const writer = fbs.writer();
+    try writer.writeAll(&[_]u8{ 13, 80, 78, 71, 13, 10, 26, 10 });
+    for (chunk_array) |chunk| try chunk.writeStream(writer);
+
+    fbs.seekTo(0) catch unreachable;
+    const reader = fbs.reader();
+
+    try testing.expectError(Png.PngError.InvalidHeader, Png.readStream(testing.allocator, reader));
 }
