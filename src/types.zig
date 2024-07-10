@@ -303,8 +303,7 @@ pub const Png = struct { // TODO: add write functions!
         errdefer self.deinit();
 
         var header: [STANDARD_HEADER.len]u8 = undefined;
-        const n = try reader.readAll(header[0..]);
-        try testing.expectEqual(STANDARD_HEADER.len, n);
+        try reader.readNoEof(header[0..]);
         if (!std.mem.eql(u8, STANDARD_HEADER, header[0..]))
             return PngError.InvalidHeader;
 
@@ -541,7 +540,7 @@ fn testing_chunks() ![]Chunk {
     return try list.toOwnedSlice();
 }
 
-test "from chunks" {
+test "from_chunks" {
     const chunks = try testing_chunks();
     defer testing.allocator.free(chunks);
 
@@ -594,4 +593,24 @@ test "invalid_header" {
     const reader = fbs.reader();
 
     try testing.expectError(Png.PngError.InvalidHeader, Png.readStream(testing.allocator, reader));
+}
+
+test "png_from_file" {
+    const data = @embedFile("test.png");
+    var fbs = std.io.fixedBufferStream(data);
+    const reader = fbs.reader();
+
+    const png = try Png.readStream(testing.allocator, reader);
+    defer png.deinitAllocatedChunks();
+
+    for (png.chunks.items) |chunk|
+        std.debug.print("{}\n", .{chunk});
+
+    const buffer: []u8 = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(buffer);
+    var fbs_two = std.io.fixedBufferStream(buffer);
+    const writer = fbs_two.writer();
+
+    try png.writeStream(writer);
+    try testing.expectEqualSlices(u8, data, buffer);
 }
