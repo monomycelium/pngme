@@ -15,11 +15,11 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // const lib = b.addModule("pngme", .{
-    //     .root_source_file = b.path("src/types.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
+    const lib = b.addModule("pngme", .{
+        .root_source_file = b.path("src/types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe = b.addExecutable(.{
         .name = "pngme",
@@ -27,6 +27,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    const clap = b.dependency("clap", .{});
+    exe.root_module.addImport("clap", clap.module("clap"));
+    exe.root_module.addImport("pngme", lib);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -59,11 +63,12 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/types.zig"),
+        .root_source_file = b.path("test/test.zig"),
         .target = target,
         .optimize = optimize,
     });
 
+    lib_unit_tests.root_module.addImport("pngme", lib);
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
