@@ -28,8 +28,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const clap = b.dependency("clap", .{});
-    exe.root_module.addImport("clap", clap.module("clap"));
+    const yazap = b.dependency("yazap", .{});
+    exe.root_module.addImport("yazap", yazap.module("yazap"));
     exe.root_module.addImport("pngme", lib);
 
     // This declares intent for the executable to be installed into the
