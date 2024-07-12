@@ -212,8 +212,8 @@ test "from_chunks" {
     defer Png.deinitMap(&map);
 
     const list = map.get("LASt".*).?;
-    for (list.items, 0..) |c, i|
-        try testing.expectEqual(c.crc(), chunks[3 + i].crc());
+    for (list.items, 0..) |j, i|
+        try testing.expectEqual(png.chunks.items[j].crc(), chunks[3 + i].crc());
 
     fbs.seekTo(0) catch unreachable;
     const reader = fbs.reader();
@@ -267,4 +267,38 @@ test "png_from_file" {
 
     try png.writeStream(writer);
     try testing.expectEqualSlices(u8, data, buffer);
+}
+
+fn png_buffer(alloc: Allocator, chunks: []const Chunk) ![]u8 {
+    var size: usize = Png.STANDARD_HEADER.len;
+    for (chunks) |chunk| size += chunk.length + 4 * 3;
+
+    const buf: []u8 = try alloc.alloc(u8, size);
+    errdefer alloc.free(buf);
+
+    return Png.writeChunks(chunks, buf);
+}
+
+test "remove" {
+    const buf = try png_buffer(testing.allocator, chunk_array[0..]);
+    defer testing.allocator.free(buf);
+    var fbs = std.io.fixedBufferStream(buf);
+    const reader = fbs.reader();
+
+    const buf_two: []u8 = try testing.allocator.alloc(u8, buf.len);
+    defer testing.allocator.free(buf_two);
+    var fbs_two = std.io.fixedBufferStream(buf_two);
+    const writer = fbs_two.writer();
+
+    const s = try Png.remove(testing.allocator, reader, writer, chunk_array[3].chunk_type);
+    try testing.expectEqual(2, s);
+
+    var fbs_three = std.io.fixedBufferStream(fbs_two.getWritten());
+    const png = try Png.readStream(testing.allocator, fbs_three.reader());
+    defer png.deinitAllocatedChunks();
+
+    const chunks: []const Chunk = png.chunks.items;
+    try testing.expectEqual(chunk_array.len, chunks.len + s);
+    for (0..3) |i| try testing.expectEqual(chunk_array[i].crc(), chunks[i].crc());
+    try testing.expectEqual(chunk_array[chunk_array.len - 1].crc(), chunks[chunks.len - 1].crc());
 }

@@ -236,7 +236,7 @@ pub const Png = struct { // TODO: add write functions!
     const Chunks = std.ArrayList(Chunk);
     pub const PngError = error{ InvalidHeader, InvalidStartChunk, InvalidEndChunk, MissingChunks };
     pub const PngModError = error{EmptyList} || Allocator.Error;
-    pub const ChunkList = std.ArrayList(*Chunk);
+    pub const ChunkList = std.ArrayListUnmanaged(usize);
     pub const Map = std.array_hash_map.ArrayHashMap([4]u8, ChunkList, ChunkType.ChunkTypeContext, true);
 
     chunks: Chunks,
@@ -262,18 +262,18 @@ pub const Png = struct { // TODO: add write functions!
         last.* = chunk;
     }
 
-    /// Generate a hash map, where chunk type is the key and pointer to chunk is the value.
+    /// Generate a hash map, where chunk type is the key and index of chunk is the value.
     pub fn chunksByType(self: Self) !Map {
         var map = Map.init(self.chunks.allocator);
         errdefer map.deinit();
 
-        for (self.chunks.items) |*chunk| {
+        for (self.chunks.items, 0..) |*chunk, i| {
             const result = try map.getOrPut(chunk.chunk_type.bytes);
 
             if (!result.found_existing)
                 result.value_ptr.* = try ChunkList.initCapacity(self.chunks.allocator, 1);
 
-            try result.value_ptr.append(chunk);
+            try result.value_ptr.append(self.chunks.allocator, i);
         }
 
         return map;
@@ -282,7 +282,7 @@ pub const Png = struct { // TODO: add write functions!
     pub fn deinitMap(map: *Map) void {
         var iter = map.iterator();
         while (iter.next()) |entry|
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(map.allocator);
         map.deinit();
     }
 
@@ -336,17 +336,81 @@ pub const Png = struct { // TODO: add write functions!
             try chunk.writeStream(writer);
     }
 
-    /// write PNG data to buffer.
-    pub fn write(self: Self, buffer: []u8) ![]u8 {
+    /// write PNG data to buffer (for `const`-qualified pointers).
+    pub fn writeChunks(chunks: []const Chunk, buffer: []u8) ![]u8 {
         std.mem.copyForwards(u8, buffer, Self.STANDARD_HEADER);
         var i: usize = Self.STANDARD_HEADER.len;
 
-        for (self.chunks.items) |chunk| {
+        for (chunks) |chunk| {
             const out = try chunk.write(buffer[i..]);
             i += out.len;
         }
 
         return buffer[0..i];
+    }
+
+    /// write PNG data to buffer.
+    pub fn write(self: Self, buffer: []u8) ![]u8 {
+        return Self.writeChunks(self.chunks.items, buffer);
+    }
+
+    pub fn encode(
+        alloc: Allocator,
+        input_reader: anytype,
+        output_writer: anytype,
+        chunk_type: ChunkType,
+        data_reader: anytype,
+    ) !void {
+        const data: []const u8 = try data_reader.readAllAlloc(alloc, std.math.maxInt(usize));
+        defer alloc.free(data);
+        const chunk = try Chunk.init(chunk_type, data);
+
+        var png = try Png.readStream(alloc, input_reader);
+        defer png.deinitAllocatedChunks();
+
+        try png.appendChunk(chunk);
+        try png.writeStream(output_writer);
+    }
+
+    pub fn decode(alloc: Allocator, input_reader: anytype, chunk_type: ChunkType) !?[]Chunk {
+        var png = try Png.readStream(alloc, input_reader);
+        defer png.deinitAllocatedChunks();
+
+        var map = try png.chunksByType();
+        defer Png.deinitMap(&map);
+        const list = map.get(chunk_type.bytes) orelse return null;
+
+        var new_list = try Chunks.initCapacity(alloc, list.items.len);
+        errdefer new_list.deinit();
+        for (list.items) |i| new_list.appendAssumeCapacity(png.chunks.items[i]);
+
+        return try new_list.toOwnedSlice();
+    }
+
+    pub fn remove(
+        alloc: Allocator,
+        input_reader: anytype,
+        output_writer: anytype,
+        chunk_type: ChunkType,
+    ) !usize {
+        var png = try Png.readStream(alloc, input_reader);
+        defer png.deinitAllocatedChunks();
+
+        var new_png: Png = undefined;
+        defer new_png.deinit();
+        new_png.chunks = try Chunks.initCapacity(alloc, png.chunks.items.len);
+
+        for (png.chunks.items) |chunk|
+            if (!ChunkType.ChunkTypeContext.eql(
+                .{},
+                chunk_type.bytes,
+                chunk.chunk_type.bytes,
+                undefined,
+            ))
+                new_png.chunks.appendAssumeCapacity(chunk);
+
+        try new_png.writeStream(output_writer);
+        return png.chunks.items.len - new_png.chunks.items.len;
     }
 
     pub fn format(
