@@ -356,8 +356,9 @@ pub const Png = struct { // TODO: add write functions!
         writer: anytype,
     ) !void {
         _ = fmt;
+        _ = options;
 
         for (self.chunks.items) |chunk|
-            try chunk.format("{}", options, writer);
+            try writer.print("{}\n", .{chunk});
     }
 };
