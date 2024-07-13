@@ -354,7 +354,7 @@ pub const Png = struct { // TODO: add write functions!
         return Self.writeChunks(self.chunks.items, buffer);
     }
 
-    pub fn encode(
+    pub fn encode( // TODO: fix bug where second-last chunk is replaced.
         alloc: Allocator,
         input_reader: anytype,
         output_writer: anytype,

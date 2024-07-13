@@ -39,19 +39,27 @@ fn getPositional(map: *const yazap.arg_matches.ArgHashMap, key: []const u8) erro
 // TODO: in `ArgHashMap`, can the tagged union be assumed to be `.single`?
 const Parsed = struct { // `undefined` for unused fields
     const Self = @This();
+    const TEMP_EXT = ".temp";
 
+    alloc: std.mem.Allocator,
     input: std.fs.File,
     chunk_type: pnglib.ChunkType,
     data: ?std.fs.File,
     output: ?std.fs.File,
+    /// Name of temporary file (only if editing in-place).
+    /// The original file will be replaced with the temporary file.
+    /// The name must be the name of the original file with `TEMP_EXT` appended.
+    temp_name: ?[]const u8,
     subcmd: Subcommand,
 
-    fn init(cmd: *const yazap.arg_matches.MatchedSubCommand) !Self {
+    fn init(cmd: *const yazap.arg_matches.MatchedSubCommand, alloc: std.mem.Allocator) !Self {
         var self: Self = .{
             .input = undefined,
             .chunk_type = undefined,
             .data = null,
             .output = null,
+            .temp_name = null,
+            .alloc = alloc,
             .subcmd = @enumFromInt(cmd.name[0]),
         };
         const args: *const yazap.arg_matches.ArgHashMap = &cmd.matches.?.args;
@@ -61,7 +69,7 @@ const Parsed = struct { // `undefined` for unused fields
 
         const input_b = try getPositional(args, "INPUT");
         self.input = try cwd.openFile(input_b, .{ .mode = .read_only });
-        errdefer self.deinit();
+        errdefer self.input.close();
 
         if (self.subcmd == .chunks) return self;
 
@@ -74,20 +82,40 @@ const Parsed = struct { // `undefined` for unused fields
 
         if (args.get("OUTPUT")) |output| {
             self.output = try cwd.createFile(output.single, .{ .read = false });
-        } else self.output = try cwd.openFile(input_b, .{ .mode = .write_only });
+        } else {
+            self.temp_name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ input_b, TEMP_EXT });
+            self.output = try cwd.createFile(self.temp_name.?, .{ .read = false, .exclusive = true });
+        }
+        errdefer self.output.?.close();
+        errdefer if (self.temp_name) |t| alloc.free(t);
 
         if (self.subcmd == .remove) return self;
 
         const data_b = try getPositional(args, "DATA");
         self.data = try cwd.openFile(data_b, .{ .mode = .read_only });
+        errdefer self.data.?.close();
 
         return self;
     }
 
-    fn deinit(self: *const Self) void {
+    fn deinit(self: Self) void {
         self.input.close();
-        if (self.output) |o| o.close();
         if (self.data) |d| d.close();
+        if (self.output) |o| o.close();
+    }
+
+    fn deinitWrite(self: *const Self) !void {
+        self.deinit();
+
+        if (self.temp_name) |name| {
+            const cwd = std.fs.cwd();
+            const old = name[0 .. name.len - TEMP_EXT.len];
+
+            try cwd.deleteFile(old);
+            try cwd.rename(name, old);
+
+            self.alloc.free(name);
+        }
     }
 };
 
@@ -126,23 +154,23 @@ pub fn main() !void {
         return yazap.YazapError.CommandSubcommandNotProvided;
     };
 
-    const parsed = try Parsed.init(cmd);
-    defer parsed.deinit();
+    const parsed = try Parsed.init(cmd, alloc);
+    errdefer parsed.deinit();
 
     var input_bfr = std.io.bufferedReader(parsed.input.reader());
-    var output_bfr = if (parsed.output) |o| std.io.bufferedWriter(o.writer()) else null;
-    var data_bfr = if (parsed.data) |d| std.io.bufferedReader(d.reader()) else null;
+    var data_bfr = if (parsed.data) |d| std.io.bufferedReader(d.reader()) else undefined;
     const stdout = std.io.getStdOut().writer();
+    var output_bfw = if (parsed.output) |o| std.io.bufferedWriter(o.writer()) else undefined;
 
     switch (parsed.subcmd) {
         .encode => try pnglib.Png.encode(
             alloc,
             input_bfr.reader(),
-            output_bfr.?.writer(),
+            output_bfw.writer(),
             parsed.chunk_type,
-            data_bfr.?.reader(),
+            data_bfr.reader(),
         ),
-        .decode => {
+        .decode => { // when making debug build, every byte of chunk data is printed as \xaa. TODO: investigate
             const chunks = try pnglib.Png.decode(
                 alloc,
                 input_bfr.reader(),
@@ -152,19 +180,24 @@ pub fn main() !void {
             if (chunks) |cs| {
                 defer alloc.free(cs);
                 for (cs) |c| try stdout.print("{}\n", .{c});
-            } else {
-                try stdout.print("no chunks of type {s} found\n", .{parsed.chunk_type.bytes[0..]});
-            }
+            } else try stdout.print("no chunks of type {s} found\n", .{parsed.chunk_type.bytes[0..]});
         },
-        .remove => _ = try pnglib.Png.remove(
-            alloc,
-            input_bfr.reader(),
-            output_bfr.?.writer(),
-            parsed.chunk_type,
-        ),
+        .remove => {
+            const n = try pnglib.Png.remove(
+                alloc,
+                input_bfr.reader(),
+                output_bfw.writer(),
+                parsed.chunk_type,
+            );
+
+            try stdout.print("removed {d} items\n", .{n});
+        },
         .chunks => {
             const png = try pnglib.Png.readStream(alloc, input_bfr.reader());
             try png.format("{}", .{}, stdout);
         },
     }
+
+    try output_bfw.flush();
+    try parsed.deinitWrite();
 }
